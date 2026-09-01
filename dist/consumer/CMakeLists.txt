@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.28)
+cmake_policy(SET CMP0155 OLD)
+project(af_consumer CXX)
+find_package(ArtifactFabric CONFIG REQUIRED)
+add_executable(cons main.cpp)
+target_link_libraries(cons PRIVATE af::artifact_fabric)

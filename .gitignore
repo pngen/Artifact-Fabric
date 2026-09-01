@@ -1,0 +1,35 @@
+# Build artifacts
+/build/
+/build-*/
+*.obj
+*.lib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.o
+*.a
+*.so
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+
+# Runtime state / temp
+*_state.bin
+af_state.bin
+*.tmp
+out.txt
+err.txt
+
+# IDE
+.vscode/
+.idea/
+*.user
+/internal_install/
+/dev_env.bat
