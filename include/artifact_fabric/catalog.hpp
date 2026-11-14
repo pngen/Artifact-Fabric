@@ -82,6 +82,8 @@ class Catalog {
     Catalog* cat = nullptr;
     ArtifactId reserved_id{};
     std::uint64_t reserved_bytes = 0;
+    bool new_backing = false;   // produce() stored new content (physical bytes are added at commit)
+    bool committed = false;     // a committed publication cannot be aborted
   };
   PublishTransaction begin_publish();
 
@@ -134,7 +136,7 @@ class Catalog {
 
  private:
   friend struct PublishTransaction;
-  void fence(const AuthorityEnvelope& auth) const;
+  void fence(const AuthorityEnvelope& auth) const;   // caller holds mu_ exclusively
   void fence_epoch(CoordinatorEpoch epoch) const;
   void add_to_indexes(const ArtifactDescriptor& d);
   void remove_from_indexes(const ArtifactDescriptor& d);

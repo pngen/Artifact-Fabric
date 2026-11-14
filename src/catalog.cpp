@@ -60,8 +60,9 @@ void Catalog::roll_epoch(WorkerBootId new_boot) {
   boot_ = new_boot;
 }
 
+// The caller holds mu_ exclusively for the whole mutation, so an epoch roll
+// cannot land between this check and the change it guards.
 void Catalog::fence(const AuthorityEnvelope& a) const {
-  std::shared_lock<std::shared_mutex> lk(mu_);
   if (a.epoch != epoch_) throw AuthorityError(AuthorityReject::STALE_EPOCH, "epoch does not match current authority");
   if (a.boot != boot_) throw AuthorityError(AuthorityReject::STALE_BOOT, "boot id does not match current authority");
   if (a.producer_generation.is_set() && a.producer_generation.value() > 1) {
@@ -203,8 +204,8 @@ std::vector<ArtifactId> Catalog::dependents_of(ArtifactId id) const {
 // Registration
 // ---------------------------------------------------------------------------
 ArtifactId Catalog::register_artifact(const ArtifactDescriptor& desc, const AuthorityEnvelope& auth) {
-  fence(auth);
   std::unique_lock<std::shared_mutex> lk(mu_);
+  fence(auth);
   if (artifacts_.count(desc.id)) throw std::logic_error("duplicate artifact id on register");
   ArtifactDescriptor d = desc;
   if (d.generation.is_set() && d.generation.value() >= next_artifact_generation_.value())
@@ -220,19 +221,21 @@ ArtifactId Catalog::register_artifact(const ArtifactDescriptor& desc, const Auth
 // Publication
 // ---------------------------------------------------------------------------
 PublishResult Catalog::publish(const PublishRequest& req) {
-  fence(req.authority);
   ContentDigest cd = ContentDigest(Sha256::digest(req.content.data(), req.content.size()));
   ArtifactDescriptor d = req.descriptor;
   d.content_digest = cd;
   if (d.producer.is_zero()) d.producer = req.authority.producer;
   if (d.producer_generation.value() == 0) d.producer_generation = req.authority.producer_generation;
   if (d.id.is_zero()) d.id = derive_artifact_id(d, d.generation);
-  if (!d.generation.is_set()) d.generation = next_artifact_generation_;
 
   std::unique_lock<std::shared_mutex> lk(mu_);
+  fence(req.authority);
+  if (!d.generation.is_set()) d.generation = next_artifact_generation_;
   if (artifacts_.count(d.id)) throw std::logic_error("duplicate artifact id on publish");
   if (req.authority.artifact_generation.is_set() && req.authority.artifact_generation < d.generation)
     throw AuthorityError(AuthorityReject::STALE_ARTIFACT_GENERATION, "attempted to publish a generation below authority");
+  // A dependency set the graph refuses is rejected before anything is stored.
+  graph_.check_new_edges(d.id, d.dependencies);
 
   d.lifecycle = LifecycleState::BUILDING;
 
@@ -241,7 +244,8 @@ PublishResult Catalog::publish(const PublishRequest& req) {
   if (it == content_store_.end()) {
     content_store_[cd] = ContentRef{req.content, 1};
     accounts_.add_physical_backing();
-    accounts_.add_physical_bytes(static_cast<std::int64_t>(size));
+    // Physical bytes are the stored bytes (retire subtracts the same amount).
+    accounts_.add_physical_bytes(static_cast<std::int64_t>(req.content.size()));
   } else {
     ++it->second.refcount;
     if (it->second.refcount > 1) accounts_.add_dedup_bytes(static_cast<std::int64_t>(size));
@@ -283,13 +287,13 @@ Catalog::PublishTransaction Catalog::begin_publish() {
   return t;
 }
 ArtifactId Catalog::PublishTransaction::reserve(const PublishRequest& req) {
-  cat->fence(req.authority);
   ArtifactDescriptor d = req.descriptor;
-  if (d.generation.is_set() && d.generation.value() >= cat->next_artifact_generation_.value())
-    cat->next_artifact_generation_ = d.generation.next();
   if (d.id.is_zero()) d.id = derive_artifact_id(d, d.generation);
   std::unique_lock<std::shared_mutex> lk(cat->mu_);
+  cat->fence(req.authority);
   if (cat->artifacts_.count(d.id)) throw std::logic_error("duplicate reserve id");
+  if (d.generation.is_set() && d.generation.value() >= cat->next_artifact_generation_.value())
+    cat->next_artifact_generation_ = d.generation.next();
   d.lifecycle = LifecycleState::BUILDING;
   cat->accounts_.reserve_build();
   cat->accounts_.add_temp_publication_bytes(static_cast<std::int64_t>(req.content.size()));
@@ -299,32 +303,38 @@ ArtifactId Catalog::PublishTransaction::reserve(const PublishRequest& req) {
   return d.id;
 }
 void Catalog::PublishTransaction::produce(ArtifactId id, const std::vector<std::uint8_t>& content, const AuthorityEnvelope& auth) {
-  cat->fence(auth);
+  ContentDigest cd = ContentDigest(Sha256::digest(content.data(), content.size()));
   std::unique_lock<std::shared_mutex> lk(cat->mu_);
+  cat->fence(auth);
   auto it = cat->artifacts_.find(id);
   if (it == cat->artifacts_.end()) throw std::logic_error("produce on unregistered artifact");
-  ContentDigest cd = ContentDigest(Sha256::digest(content.data(), content.size()));
+  LifecycleState next = it->second.lifecycle;
+  apply_transition(next, LifecycleState::VALIDATING);   // throws before any change
   it->second.content_digest = cd;
-  it->second.lifecycle = LifecycleState::VALIDATING;
+  it->second.lifecycle = next;
   auto cs = cat->content_store_.find(cd);
-  if (cs == cat->content_store_.end()) cat->content_store_[cd] = ContentRef{content, 1};
+  new_backing = cs == cat->content_store_.end();
+  if (new_backing) cat->content_store_[cd] = ContentRef{content, 1};
   else ++cs->second.refcount;
   reserved_bytes = content.size();
 }
 void Catalog::PublishTransaction::validate_publish(ArtifactId id, const ValidationReport& report, const AuthorityEnvelope& auth) {
-  cat->fence(auth);
   std::unique_lock<std::shared_mutex> lk(cat->mu_);
+  cat->fence(auth);
   auto it = cat->artifacts_.find(id);
   if (it == cat->artifacts_.end()) throw std::logic_error("validate on unregistered artifact");
+  LifecycleState next = it->second.lifecycle;
+  apply_transition(next, report.all_ok() ? LifecycleState::VALID : LifecycleState::FAILED);
   it->second.validation_state = report.state;
-  it->second.lifecycle = report.all_ok() ? LifecycleState::VALID : LifecycleState::FAILED;
+  it->second.lifecycle = next;
 }
 void Catalog::PublishTransaction::verify_dependencies(ArtifactId id, const AuthorityEnvelope& auth) {
-  cat->fence(auth);
   std::unique_lock<std::shared_mutex> lk(cat->mu_);
+  cat->fence(auth);
   auto it = cat->artifacts_.find(id);
   if (it == cat->artifacts_.end()) throw std::logic_error("verify-deps on unregistered artifact");
   ArtifactDescriptor d = it->second;
+  cat->graph_.check_new_edges(id, d.dependencies);
   if (!cat->graph_.has_node(id)) cat->graph_.add_node(id);
   for (const auto& dep : d.dependencies) {
     if (!cat->graph_.has_node(dep.artifact)) cat->graph_.add_node(dep.artifact);
@@ -334,29 +344,40 @@ void Catalog::PublishTransaction::verify_dependencies(ArtifactId id, const Autho
   cat->artifacts_[id] = d;
 }
 void Catalog::PublishTransaction::commit(ArtifactId id, const AuthorityEnvelope& auth) {
-  cat->fence(auth);
   std::unique_lock<std::shared_mutex> lk(cat->mu_);
+  cat->fence(auth);
   auto it = cat->artifacts_.find(id);
   if (it == cat->artifacts_.end()) throw std::logic_error("commit on unregistered artifact");
-  it->second.lifecycle = LifecycleState::PUBLISHED;
+  // Only a validated artifact becomes authoritative (VALID -> PUBLISHED).
+  LifecycleState next = it->second.lifecycle;
+  apply_transition(next, LifecycleState::PUBLISHED);
+  it->second.lifecycle = next;
   const std::uint64_t size = it->second.size_bytes != 0 ? it->second.size_bytes : reserved_bytes;
   cat->accounts_.release_build();
   cat->accounts_.add_temp_publication_bytes(-static_cast<std::int64_t>(reserved_bytes));
   cat->accounts_.add_logical_artifact();
   cat->accounts_.add_logical_bytes(static_cast<std::int64_t>(size));
   cat->accounts_.add_active_reference();
-  cat->accounts_.add_physical_backing();
-  cat->accounts_.add_physical_bytes(static_cast<std::int64_t>(size));
+  if (new_backing) {
+    // Shared content was already counted by whoever stored it first.
+    auto cs = cat->content_store_.find(it->second.content_digest);
+    cat->accounts_.add_physical_backing();
+    cat->accounts_.add_physical_bytes(static_cast<std::int64_t>(cs != cat->content_store_.end() ? cs->second.bytes.size() : 0));
+  }
   cat->add_to_indexes(it->second);
+  committed = true;
 }
 void Catalog::PublishTransaction::abort(ArtifactId id) {
   std::unique_lock<std::shared_mutex> lk(cat->mu_);
+  if (committed) throw std::logic_error("cannot abort a committed publication");
+  if (id != reserved_id) throw std::logic_error("abort of an artifact this transaction did not reserve");
   auto it = cat->artifacts_.find(id);
   if (it != cat->artifacts_.end()) {
     auto cd = it->second.content_digest;
     auto cs = cat->content_store_.find(cd);
     if (cs != cat->content_store_.end() && --cs->second.refcount == 0) cat->content_store_.erase(cd);
     cat->artifacts_.erase(id);
+    cat->graph_.remove_out_edges(id);   // edges added by verify_dependencies
   }
   cat->accounts_.release_build();
   cat->accounts_.add_temp_publication_bytes(-static_cast<std::int64_t>(reserved_bytes));
@@ -365,32 +386,38 @@ void Catalog::PublishTransaction::abort(ArtifactId id) {
 // ---------------------------------------------------------------------------
 // Lifecycle operations
 // ---------------------------------------------------------------------------
+// Lifecycle operations check the transition before changing anything, so a
+// rejected transition leaves the descriptor and every index unchanged.
 void Catalog::validate_artifact(ArtifactId id, const ValidationReport& report, const AuthorityEnvelope& auth) {
-  fence(auth);
   std::unique_lock<std::shared_mutex> lk(mu_);
+  fence(auth);
   auto it = artifacts_.find(id);
   if (it == artifacts_.end()) throw std::out_of_range("unknown artifact");
   if (auth.artifact_generation.is_set() && auth.artifact_generation < it->second.generation)
     throw AuthorityError(AuthorityReject::STALE_ARTIFACT_GENERATION, "stale artifact generation on validate");
+  LifecycleState next = it->second.lifecycle;
+  apply_transition(next, report.all_ok() ? LifecycleState::VALID : LifecycleState::FAILED);
   remove_from_indexes(it->second);
   it->second.validation_state = report.state;
-  apply_transition(it->second.lifecycle, report.all_ok() ? LifecycleState::VALID : LifecycleState::FAILED);
+  it->second.lifecycle = next;
   add_to_indexes(it->second);
 }
 void Catalog::promote(ArtifactId id, const AuthorityEnvelope& auth) {
-  fence(auth);
   std::unique_lock<std::shared_mutex> lk(mu_);
+  fence(auth);
   auto it = artifacts_.find(id);
   if (it == artifacts_.end()) throw std::out_of_range("unknown artifact");
   if (auth.artifact_generation.is_set() && auth.artifact_generation < it->second.generation)
     throw AuthorityError(AuthorityReject::STALE_ARTIFACT_GENERATION, "stale artifact generation on promote");
+  LifecycleState next = it->second.lifecycle;
+  apply_transition(next, LifecycleState::ACTIVE);
   remove_from_indexes(it->second);
-  apply_transition(it->second.lifecycle, LifecycleState::ACTIVE);
+  it->second.lifecycle = next;
   add_to_indexes(it->second);
 }
 void Catalog::supersede(ArtifactId superseded, ArtifactId successor, const std::string& reason, const AuthorityEnvelope& auth) {
-  fence(auth);
   std::unique_lock<std::shared_mutex> lk(mu_);
+  fence(auth);
   auto old = artifacts_.find(superseded);
   auto neu = artifacts_.find(successor);
   if (old == artifacts_.end()) throw std::out_of_range("unknown superseded artifact");
@@ -399,8 +426,10 @@ void Catalog::supersede(ArtifactId superseded, ArtifactId successor, const std::
     throw std::logic_error("cannot supersede a retired/evicted artifact");
   if (auth.artifact_generation.is_set() && auth.artifact_generation < neu->second.generation)
     throw AuthorityError(AuthorityReject::STALE_ARTIFACT_GENERATION, "stale artifact generation on supersede");
+  LifecycleState next = old->second.lifecycle;
+  apply_transition(next, LifecycleState::SUPERSEDED);
   remove_from_indexes(old->second);
-  apply_transition(old->second.lifecycle, LifecycleState::SUPERSEDED);
+  old->second.lifecycle = next;
   add_to_indexes(old->second);
   successor_of_[superseded].push_back(successor);
   predecessor_of_[successor].push_back(superseded);
@@ -408,50 +437,58 @@ void Catalog::supersede(ArtifactId superseded, ArtifactId successor, const std::
   (void)reason;
 }
 void Catalog::invalidate(ArtifactId id, const std::string& cause, const AuthorityEnvelope& auth) {
-  fence(auth);
   std::unique_lock<std::shared_mutex> lk(mu_);
+  fence(auth);
   auto it = artifacts_.find(id);
   if (it == artifacts_.end()) throw std::out_of_range("unknown artifact");
   if (auth.artifact_generation.is_set() && auth.artifact_generation < it->second.generation)
     throw AuthorityError(AuthorityReject::STALE_ARTIFACT_GENERATION, "stale artifact generation on invalidate");
+  const LifecycleState ls = it->second.lifecycle;
+  if (ls != LifecycleState::INVALIDATED && ls != LifecycleState::RETIRED && ls != LifecycleState::EVICTED) {
+    LifecycleState next = ls;
+    apply_transition(next, LifecycleState::INVALIDATED);   // the target itself must be invalidatable
+  }
   invalidate_dependents(id, cause);
 }
+// Invalidates `id` and its transitive dependents.  A dependent whose state has
+// no INVALIDATED transition (quarantined, superseded, failed, not yet
+// published, retired, evicted) keeps its state; propagation still reaches
+// everything that depends on it, and nothing throws midway.
 void Catalog::invalidate_dependents(ArtifactId id, const std::string& cause) {
-  auto it = artifacts_.find(id);
-  if (it != artifacts_.end() && it->second.lifecycle != LifecycleState::INVALIDATED &&
-      it->second.lifecycle != LifecycleState::RETIRED && it->second.lifecycle != LifecycleState::EVICTED) {
+  auto mark = [&](const ArtifactId& target) {
+    auto it = artifacts_.find(target);
+    if (it == artifacts_.end() || !can_transition(it->second.lifecycle, LifecycleState::INVALIDATED)) return;
     remove_from_indexes(it->second);
-    apply_transition(it->second.lifecycle, LifecycleState::INVALIDATED);
+    it->second.lifecycle = LifecycleState::INVALIDATED;
     add_to_indexes(it->second);
-    invalidation_cause_[id] = cause;
+    invalidation_cause_[target] = cause;
     accounts_.record_invalidation();
-  }
-  for (const auto& dep : graph_.dependents(id)) {
-    auto dit = artifacts_.find(dep);
-    if (dit != artifacts_.end() && dit->second.lifecycle != LifecycleState::INVALIDATED &&
-        dit->second.lifecycle != LifecycleState::RETIRED && dit->second.lifecycle != LifecycleState::EVICTED) {
-      invalidate_dependents(dep, cause);
-    }
-  }
+  };
+  mark(id);
+  for (const auto& dep : graph_.dependents(id)) mark(dep);   // transitive dependents
 }
 void Catalog::quarantine(ArtifactId id, const QuarantineRecord& qr, const AuthorityEnvelope& auth) {
-  fence(auth);
   std::unique_lock<std::shared_mutex> lk(mu_);
+  fence(auth);
   auto it = artifacts_.find(id);
   if (it == artifacts_.end()) throw std::out_of_range("unknown artifact");
+  LifecycleState next = it->second.lifecycle;
+  apply_transition(next, LifecycleState::QUARANTINED);
   remove_from_indexes(it->second);
   it->second.validation_state = ValidationState::QUARANTINED;
-  apply_transition(it->second.lifecycle, LifecycleState::QUARANTINED);
+  it->second.lifecycle = next;
   add_to_indexes(it->second);
   quarantine_records_[id].push_back(qr);
 }
 void Catalog::retire(ArtifactId id, const AuthorityEnvelope& auth) {
-  fence(auth);
   std::unique_lock<std::shared_mutex> lk(mu_);
+  fence(auth);
   auto it = artifacts_.find(id);
   if (it == artifacts_.end()) throw std::out_of_range("unknown artifact");
+  LifecycleState next = it->second.lifecycle;
+  apply_transition(next, LifecycleState::RETIRED);
   remove_from_indexes(it->second);
-  apply_transition(it->second.lifecycle, LifecycleState::RETIRED);
+  it->second.lifecycle = next;
   auto cd = it->second.content_digest;
   auto cs = content_store_.find(cd);
   if (cs != content_store_.end()) {
@@ -606,26 +643,24 @@ void Catalog::load(const std::vector<std::uint8_t>& image, bool /*recover*/) {
   }
   d.require_end();
 
-  std::unique_lock<std::shared_mutex> lk(mu_);
-  artifacts_.clear(); graph_ = DependencyGraph(); content_store_.clear();
-  content_index_.clear(); kind_index_.clear(); producer_index_.clear();
-  model_index_.clear(); adapter_index_.clear(); runtime_index_.clear();
-  toolchain_index_.clear(); arch_index_.clear(); lifecycle_index_.clear();
-  validation_index_.clear(); provenance_index_.clear(); generation_index_.clear();
-  successor_of_.clear(); predecessor_of_.clear(); invalidation_cause_.clear(); quarantine_records_.clear();
-
-  std::unordered_set<ArtifactId> seen;
+  // Build and validate the recovered artifacts and graph before touching the
+  // live catalog: a refused image leaves it unchanged.
+  std::unordered_map<ArtifactId, ArtifactDescriptor> artifacts;
+  DependencyGraph graph;
   for (const auto& desc : loaded) {
-    if (!seen.insert(desc.id).second) throw PersistenceError("duplicate artifact id in image");
-    if (artifacts_.count(desc.id)) throw PersistenceError("duplicate artifact id");
-    artifacts_[desc.id] = desc;
-    graph_.add_node(desc.id);
+    if (!artifacts.emplace(desc.id, desc).second) throw PersistenceError("duplicate artifact id in image");
+    graph.add_node(desc.id);
     for (const auto& dep : desc.dependencies) {
       if (dep.artifact == desc.id) throw PersistenceError("self-dependency in image");
-      if (!graph_.has_node(dep.artifact)) graph_.add_node(dep.artifact);
-      graph_.add_edge(desc.id, dep);
+      if (!graph.has_node(dep.artifact)) graph.add_node(dep.artifact);
+      graph.add_edge(desc.id, dep);
     }
   }
+
+  std::unique_lock<std::shared_mutex> lk(mu_);
+  artifacts_ = std::move(artifacts);
+  graph_ = std::move(graph);
+  successor_of_.clear(); predecessor_of_.clear(); invalidation_cause_.clear(); quarantine_records_.clear();
   epoch_ = epoch; boot_ = boot; next_artifact_generation_ = ArtifactGeneration(nextgen);
   content_store_ = std::move(content);
   successor_of_ = std::move(succ);

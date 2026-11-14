@@ -77,6 +77,42 @@ class DependencyGraph {
     in_[dep.artifact].push_back(from);
   }
 
+  // Throws, without mutating, if add_node(from) followed by add_edge(from, d)
+  // for every d in deps would be rejected (self-dependency, duplicate edge,
+  // cycle, node limit), so callers can validate before changing other state.
+  void check_new_edges(const ArtifactId& from, const std::vector<DependencyRef>& deps) const {
+    std::set<ArtifactId> targets;
+    auto it = out_.find(from);
+    if (it != out_.end()) for (const auto& e : it->second) targets.insert(e.artifact);
+    std::set<ArtifactId> new_nodes;
+    if (!has_node(from)) new_nodes.insert(from);
+    for (const auto& dep : deps) {
+      if (from == dep.artifact) throw std::logic_error("self-dependency rejected");
+      if (!targets.insert(dep.artifact).second) throw std::logic_error("duplicate dependency edge rejected");
+      if (creates_cycle(from, dep.artifact)) throw std::logic_error("dependency cycle rejected");
+      if (!has_node(dep.artifact)) new_nodes.insert(dep.artifact);
+    }
+    if (nodes_.size() + new_nodes.size() > kMaxNodes) throw std::overflow_error("dependency graph node limit");
+  }
+
+  // Removes the outgoing edges of `id`; the node itself is removed too when
+  // nothing depends on it.
+  void remove_out_edges(const ArtifactId& id) {
+    auto it = out_.find(id);
+    if (it == out_.end()) return;
+    for (const auto& e : it->second) {
+      auto in = in_.find(e.artifact);
+      if (in != in_.end()) in->second.erase(std::remove(in->second.begin(), in->second.end(), id), in->second.end());
+    }
+    it->second.clear();
+    auto din = in_.find(id);
+    if (din == in_.end() || din->second.empty()) {
+      nodes_.erase(id);
+      out_.erase(id);
+      in_.erase(id);
+    }
+  }
+
   const std::vector<DependencyRef>& direct_dependencies(const ArtifactId& id) const {
     static const std::vector<DependencyRef> empty;
     auto it = out_.find(id);

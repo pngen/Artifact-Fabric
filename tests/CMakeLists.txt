@@ -3,6 +3,10 @@ add_executable(af_core_tests core_test.cpp)
 target_link_libraries(af_core_tests PRIVATE af::artifact_fabric)
 add_test(NAME af_core_tests COMMAND af_core_tests)
 
+add_executable(af_regression_tests regression_test.cpp)
+target_link_libraries(af_regression_tests PRIVATE af::artifact_fabric)
+add_test(NAME af_regression_tests COMMAND af_regression_tests)
+
 add_executable(af_distributed_test distributed_test.cpp)
 target_link_libraries(af_distributed_test PRIVATE af::artifact_fabric)
 add_dependencies(af_distributed_test af_coordinator af_worker)
